@@ -1,0 +1,26 @@
+**Code Activities:**
+- reading issue: reading the issue/task they're implementing
+- writing code: actively editing/writing code (not tests)
+- reading code: primarily reading existing code
+- reading docs: reading documentation (not code)
+- writing docs: writing documentation, release notes
+- writing tests: writing testing code
+- test running tests: running tests and viewing results
+- test manually checking: manually testing by hand
+- replicating bug: replicating a bug from an issue
+- setup: initial environment installation
+- troubleshooting: diagnosing errors and analyzing logs
+- git: git operations (e.g., branching, committing, pr)
+
+**AI Activities:**
+- writing prompt: writing a prompt for AI (Cursor, Claude, etc.)
+- waiting on generation: waiting for AI to generate response
+- reading generation: reviewing AI suggestions
+- editing generation: editing AI-generated code
+- generation taken: accepting AI suggestion
+- generation rejected: rejecting AI suggestion
+
+**Misc:**
+- distracted: unrelated activities (YouTube, music, etc.)
+- unknown: unclear what's happening
+

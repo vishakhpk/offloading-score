@@ -1,0 +1,318 @@
+from __future__ import annotations
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from openai import OpenAI
+
+Node = Dict[str, Any]
+
+def print_node_types(nodes: Union[List[Node], Node], depth: int = 1, sequences_only=False, verbose=True) -> None:
+    """
+    Print node_type for each node in DFS order, prefixing with '-' repeated by depth.
+    Accepts either:
+      - a list of nodes (common if the JSON root is a list)
+      - a single node (common if the JSON root is an object)
+    """
+    if isinstance(nodes, dict):
+        nodes = [nodes]
+
+    for node in nodes:
+        node_type = node.get("node_type", "<missing node_type>")
+        prefix = "-" * depth
+        if verbose:
+            print(f"{prefix} {node_type}")
+
+        # If this is a sequence, recurse into its children (if present).
+        if node_type == "sequence":
+            if 'label' not in node and 'annotation' not in node:
+                pass
+            else:
+                if not verbose and 'annotation' not in node:
+                    pass
+                elif not verbose and 'label' not in node:
+                    pass
+                else:
+                    print(node.get('label', '<missing label>'), ": ", node.get('annotation', '<missing annotation>'))
+            child_nodes = node.get("nodes", [])
+            if isinstance(child_nodes, list) and child_nodes:
+                print_node_types(child_nodes, depth=depth + 1, sequences_only=sequences_only, verbose=verbose)
+        else:
+            if not sequences_only and verbose:
+                print(node.get('action', '<missing action>'))
+
+def get_depth2_blocks(
+    data: Union[List[Node], Node]
+) -> List[List[Dict[str, Any]]]:
+    """
+    Return blocks rooted at depth-2 nodes.
+    Each block is a list of dicts:
+        {
+          "node": <original node object>,
+          "depth": <int>
+        }
+    """
+
+    if isinstance(data, dict):
+        roots = [data]
+    else:
+        roots = data
+
+    blocks: List[List[Dict[str, Any]]] = []
+
+    def collect_subtree(node: Node, depth: int, block: List[Dict[str, Any]]) -> None:
+        block.append({
+            "node": node,
+            "depth": depth,
+        })
+
+        if node.get("node_type") == "sequence":
+            for child in node.get("nodes", []) or []:
+                collect_subtree(child, depth + 1, block)
+
+    def walk(node: Node, depth: int) -> None:
+        if depth == 2:
+            block: List[Dict[str, Any]] = []
+            collect_subtree(node, depth, block)
+            blocks.append(block)
+            return
+
+        if node.get("node_type") == "sequence":
+            for child in node.get("nodes", []) or []:
+                walk(child, depth + 1)
+
+    for root in roots:
+        walk(root, depth=1)
+
+    return blocks
+
+def analyze_workflow_block(
+    block_tree: str,
+    prev_block_tree: Optional[str] = None,
+    next_block_tree: Optional[str] = None,
+    *,
+    model: str = "gpt-5-mini",
+    reasoning_effort: str = "low",
+) -> Dict[str, Any]:
+    """
+    Given a block (as a dashed-depth tree string) and optional prev/next blocks,
+    ask an OpenAI model to infer the sequence of Human vs AI-tool turns for the CURRENT block.
+
+    Returns a dict parsed from JSON with schema:
+      {
+        "steps": [
+          {
+            "actor": "Human" | "AI-tool",
+            "text": str,
+            "inferred": bool,
+            "evidence": [str]
+          }, ...
+        ]
+      }
+
+    Notes:
+    - Only summarize what happens in `block_tree`.
+    - Use prev/next ONLY to resolve ambiguous references (file name, command context, etc.).
+    """
+    client = OpenAI()
+
+    # Keep the prompt robust to unknown node schemas by instructing the model to rely on
+    # sequence annotations + action details embedded in the tree lines.
+    instructions = """You are reconstructing a human+AI-tool workflow from an event tree.
+
+Input format:
+- You will receive the CURRENT block to be analyzed as a plain text tree. Optionally you will also be given the previous
+  and next blocks for context.
+- Each line begins with one or more '-' characters indicating depth in the tree.
+- Lines correspond to nodes. Nodes are either:
+  - sequence nodes (may include a natural-language annotation of what happened; sometimes missing)
+  - action nodes (leaf events like keypresses, clicks, UI actions; often low-level)
+
+Task:
+- Produce a concise reconstruction of what is happening in the CURRENT block as a series of steps/turns.
+- Each step must be attributed to:
+  - "Human" for user actions (typing, clicking, navigating, selecting, running commands, etc.). If the user prompts a model with some text you need to actually note what the user said. Similar for if they typed code or a command.
+  - "AI-tool" for actions taken by an AI system/tool invocation (model response, code generation, applying edits,
+    opening panels, executing suggested commands, etc.) You need to actually describe what was generated by the AI-tool.
+
+
+Key inference rule:
+- Often the user prompts a model and then the model takes action; infer the AI-tool step when it is implied by the
+  subsequent user actions (e.g., user accepts a suggestion, runs a generated command, navigates to code that was produced).
+
+Use of context:
+- Use PREVIOUS/NEXT blocks only to fill gaps needed to interpret the CURRENT block (e.g., what file was opened, what command
+  was generated), but DO NOT summarize or include steps that belong to the previous/next blocks.
+
+Granularity:
+- Keep roughly the same granularity as the underlying events: don't collapse everything into 1 sentence; don't explode into
+  per-keystroke steps. Aim for a small sequence of meaningful steps. Here is an example for reference: {"actor":"human", "text":"Switched to browser/search and inspected docs: opened web search/StackOverflow-style results about random number generation, scrolled through and highlighted example lines (e.g., "How can I generate a random integer in Python?", examples showing "import random" and "random.randint(1, 10)"), and used that content to guide notebook edit", ....}
+- Aggregate consecutive low-level actions into higher-level steps where appropriate.
+
+Output:
+- Return STRICT JSON only (no markdown, no commentary) with:
+  {
+    "steps": [
+      {
+        "actor": "Human" | "AI-tool",
+        "text": "...",
+        "inferred": true/false,
+        "evidence": ["quote short fragments from the CURRENT block lines that support this step"]
+      }
+    ]
+  }
+- Evidence must come primarily from CURRENT block; you may include at most 1 short fragment from prev/next if necessary,
+  and label it with "PREV:" or "NEXT:" in the evidence string.
+"""
+
+    def fmt_block(name: str, s: Optional[str]) -> str:
+        if s is None or not s.strip():
+            return f"{name}:\n<none>\n"
+        return f"{name}:\n{s.strip()}\n"
+
+    user_input = (
+        fmt_block("PREVIOUS BLOCK (context only)", prev_block_tree)
+        + "\n"
+        + fmt_block("CURRENT BLOCK (analyze this)", block_tree)
+        + "\n"
+        + fmt_block("NEXT BLOCK (context only)", next_block_tree)
+    )
+
+    try:
+        resp = client.responses.create(
+            model=model,
+            reasoning={"effort": reasoning_effort},
+            instructions=instructions,
+            input=user_input,
+        )
+    except Exception as e:
+        print("Error during OpenAI API call:", str(e))
+        return {"steps": []}  # Return empty steps instead of raising an error
+
+    text = (resp.output_text or "").strip()
+    if not text:
+        raise RuntimeError("Empty model output.")
+
+    # Parse JSON strictly; raise with a useful error if the model output isn't valid JSON.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        text = text.replace("\\\"", "")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # raise ValueError(
+            #     "Model did not return valid JSON after replacing escaped quotes.\n"
+            #     f"Raw output:\n{text}"
+            # ) from e
+            print("Model did not return valid JSON after replacing escaped quotes.\nRaw output:\n", text)
+            return {"steps": []}  # Return empty steps instead of raising an error
+
+def convert_block_to_tree_string(node_list: List[Dict[str, Any]]) -> str:
+    tree_string = ""
+    for item in node_list:
+        node = item["node"]
+        depth = item["depth"]
+        prefix = "-" * depth
+        node_type = node.get("node_type", "<missing node_type>")
+        node_action = node.get("action", "<missing action>")
+        node_label = node.get("label", "<missing label>")
+        node_annotation = node.get("annotation", "<missing annotation>")
+        if node_type == "sequence":
+            tree_string += f"{prefix} {node_type} {node_label}: {node_annotation}\n"
+        else:
+            tree_string += f"{prefix} {node_type} {node_action}\n"
+    return tree_string
+
+
+def get_actor_turns(node_trees: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    annotated_results = []
+    print(len(node_trees), " blocks found.")
+    for idx, node_list in enumerate(node_trees):
+        print("Annotating block: ", idx)
+        # print("--- New Block ---")
+        # print("-"*40)
+        tree_string = convert_block_to_tree_string(node_list)
+        # print(tree_string)
+        try:
+            prev_tree = convert_block_to_tree_string(node_trees[idx - 1]) if idx > 0 else None
+        except IndexError:
+            prev_tree = None
+        try:
+            next_tree = convert_block_to_tree_string(node_trees[idx + 1]) if idx < len(node_trees) - 1 else None
+        except IndexError:
+            next_tree = None
+        response = analyze_workflow_block(tree_string, prev_block_tree=prev_tree, next_block_tree=next_tree, reasoning_effort="medium")
+        try:
+            annotated_results.append({'steps': response['steps'], 'block_tree': tree_string})
+        except:
+            print("Failed to get valid steps; saving block tree only for idx: ", idx)
+            annotated_results.append({'block_tree': tree_string})
+        # breakpoint()
+    return annotated_results
+    
+def recheck_missing_annotations(annotated_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Recheck blocks with missing or incomplete annotations.
+    """
+    for idx, result in enumerate(annotated_results):
+        if not result.get('steps'):
+            print(f"Rechecking block {idx} due to missing steps.")
+            tree_string = result['block_tree']
+            previous_tree = annotated_results[idx - 1].get('block_tree') if idx > 0 else None
+            next_tree = annotated_results[idx + 1].get('block_tree') if idx < len(annotated_results) - 1 else None
+            response = analyze_workflow_block(tree_string, prev_block_tree=previous_tree, next_block_tree=next_tree, reasoning_effort="high")
+            try:
+                annotated_results[idx]['steps'] = response['steps']
+            except:
+                print("Still failed to get valid steps; skipping for idx: ", idx)
+                continue
+    return annotated_results
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert one workflow JSON into block-level actor turns."
+    )
+    parser.add_argument(
+        "--input-json",
+        required=True,
+        help="Path to the input workflow JSON file.",
+    )
+    parser.add_argument(
+        "--output-json",
+        help="Optional output path. Defaults to <input>_annotated.json.",
+    )
+    parser.add_argument(
+        "--print-tree",
+        action="store_true",
+        help="Print the parsed event tree before annotation.",
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input_json)
+    output_path = Path(args.output_json) if args.output_json else input_path.with_name(
+        f"{input_path.stem}_annotated.json"
+    )
+
+    with input_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    node_trees = get_depth2_blocks(data)
+    if args.print_tree:
+        print_node_types(data, depth=1, sequences_only=False, verbose=True)
+    print(f"Annotated results will be saved to: {output_path}")
+    annotated_results = get_actor_turns(node_trees)
+    with output_path.open("w", encoding="utf-8") as f:
+        for line in annotated_results:
+            f.write(json.dumps(line) + "\n")
+
+    # Optionally recheck missing annotations
+    rechecked_results = recheck_missing_annotations(annotated_results)
+    if rechecked_results != annotated_results:
+        rechecked_output_path = output_path.with_name(
+            output_path.name.replace("_annotated.json", "_rechecked_annotated.json")
+        )
+        print(f"Rechecked annotated results will be saved to: {rechecked_output_path}")
+        with rechecked_output_path.open("w", encoding="utf-8") as f:
+            for line in rechecked_results:
+                f.write(json.dumps(line) + "\n")

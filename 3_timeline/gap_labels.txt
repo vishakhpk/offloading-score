@@ -1,0 +1,5 @@
+**Gap Activities:**
+- compiling: waiting for code to compile
+- waiting on generation: waiting for AI to generate response
+- thinking: mentally planning, analyzing, or reasoning about the task approach
+- pause: away from keyboard

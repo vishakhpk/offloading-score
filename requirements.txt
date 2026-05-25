@@ -1,0 +1,24 @@
+# Core dependencies for the offloading-score pipeline.
+# Install with: pip install -r requirements.txt
+
+# LLM-backed segmentation, annotation, induction, gap classification, and scoring
+openai>=1.0
+
+# Environment loading (.env files for OPENAI_API_KEY etc.)
+python-dotenv>=1.0
+
+# Image handling for screenshots (segmentation, annotation, visualization)
+Pillow>=10.0
+
+# Action database parsing in preprocessing
+pandas>=2.0
+SQLAlchemy>=2.0
+
+# GitHub issue summarization (optional preprocessing step)
+requests>=2.31
+
+# Segmentation similarity computations
+numpy>=1.24
+
+# Timeline / breakdown visualizations
+matplotlib>=3.7
